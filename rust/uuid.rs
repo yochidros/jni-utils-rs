@@ -1,7 +1,7 @@
 use jni::{
     errors::Result,
-    objects::{AutoLocal, JMethodID, JObject},
-    signature::{JavaType, Primitive},
+    objects::{AutoLocal, JClass, JMethodID, JObject},
+    signature::{Primitive, ReturnType},
     sys::jlong,
     JNIEnv,
 };
@@ -12,14 +12,14 @@ use uuid::Uuid;
 ///
 /// Looks up the class and method IDs on creation rather than for every method
 /// call.
-pub struct JUuid<'a: 'b, 'b> {
+pub struct JUuid<'a> {
     internal: JObject<'a>,
-    get_least_significant_bits: JMethodID<'a>,
-    get_most_significant_bits: JMethodID<'a>,
-    env: &'b JNIEnv<'a>,
+    get_least_significant_bits: JMethodID,
+    get_most_significant_bits: JMethodID,
+    env: JNIEnv<'a>,
 }
 
-impl<'a: 'b, 'b> JUuid<'a, 'b> {
+impl<'a> JUuid<'a> {
     /// Create a [`JUuid`] from the environment and an object. This looks up
     /// the necessary class and method IDs to call all of the methods on it so
     /// that extra work doesn't need to be done on every method call.
@@ -28,8 +28,9 @@ impl<'a: 'b, 'b> JUuid<'a, 'b> {
     ///
     /// * `env` - Java environment to use.
     /// * `obj` - Object to wrap.
-    pub fn from_env(env: &'b JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
-        let class = env.auto_local(env.find_class("java/util/UUID")?);
+    pub fn from_env(env: &mut JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
+        let class = env.find_class("java/util/UUID")?;
+        let class = env.auto_local(class);
         Self::from_env_impl(env, obj, class)
     }
 
@@ -40,44 +41,46 @@ impl<'a: 'b, 'b> JUuid<'a, 'b> {
     ///
     /// * `env` - Java environment to use.
     /// * `uuid` - [`Uuid`] to convert into a `java.util.UUID`.
-    pub fn new(env: &'b JNIEnv<'a>, uuid: Uuid) -> Result<Self> {
+    pub fn new(env: &mut JNIEnv<'a>, uuid: Uuid) -> Result<Self> {
         let val = uuid.as_u128();
         let least = (val & 0xFFFFFFFFFFFFFFFF) as jlong;
         let most = ((val >> 64) & 0xFFFFFFFFFFFFFFFF) as jlong;
 
-        let class = env.auto_local(env.find_class("java/util/UUID")?);
+        let class = env.find_class("java/util/UUID")?;
+        let class = env.auto_local(class);
         let obj = env.new_object(&class, "(JJ)V", &[most.into(), least.into()])?;
         Self::from_env_impl(env, obj, class)
     }
 
     /// Convert the `java.util.UUID` into a [`Uuid`].
     pub fn as_uuid(&self) -> Result<Uuid> {
-        let least = self
-            .env
-            .call_method_unchecked(
-                self.internal,
+        let mut env = unsafe { self.env.unsafe_clone() };
+        let least = unsafe {
+            env.call_method_unchecked(
+                &self.internal,
                 self.get_least_significant_bits,
-                JavaType::Primitive(Primitive::Long),
+                ReturnType::Primitive(Primitive::Long),
                 &[],
-            )?
-            .j()? as u64;
-        let most = self
-            .env
-            .call_method_unchecked(
-                self.internal,
+            )
+        }?
+        .j()? as u64;
+        let most = unsafe {
+            env.call_method_unchecked(
+                &self.internal,
                 self.get_most_significant_bits,
-                JavaType::Primitive(Primitive::Long),
+                ReturnType::Primitive(Primitive::Long),
                 &[],
-            )?
-            .j()? as u64;
+            )
+        }?
+        .j()? as u64;
         let val = ((most as u128) << 64) | (least as u128);
         Ok(Uuid::from_u128(val))
     }
 
     fn from_env_impl(
-        env: &'b JNIEnv<'a>,
+        env: &mut JNIEnv<'a>,
         obj: JObject<'a>,
-        class: AutoLocal<'a, 'b>,
+        class: AutoLocal<'a, JClass<'a>>,
     ) -> Result<Self> {
         let get_least_significant_bits =
             env.get_method_id(&class, "getLeastSignificantBits", "()J")?;
@@ -87,12 +90,12 @@ impl<'a: 'b, 'b> JUuid<'a, 'b> {
             internal: obj,
             get_least_significant_bits,
             get_most_significant_bits,
-            env,
+            env: unsafe { env.unsafe_clone() },
         })
     }
 }
 
-impl<'a: 'b, 'b> ::std::ops::Deref for JUuid<'a, 'b> {
+impl<'a> ::std::ops::Deref for JUuid<'a> {
     type Target = JObject<'a>;
 
     fn deref(&self) -> &Self::Target {
@@ -100,8 +103,8 @@ impl<'a: 'b, 'b> ::std::ops::Deref for JUuid<'a, 'b> {
     }
 }
 
-impl<'a: 'b, 'b> From<JUuid<'a, 'b>> for JObject<'a> {
-    fn from(other: JUuid<'a, 'b>) -> JObject<'a> {
+impl<'a> From<JUuid<'a>> for JObject<'a> {
+    fn from(other: JUuid<'a>) -> JObject<'a> {
         other.internal
     }
 }

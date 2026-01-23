@@ -16,10 +16,10 @@ path = "rust/lib.rs"
 [features]
 build-java-support = []
 
-[dependencies] 
+[dependencies]
 # This needs to stay at 0.19.0 until we either update for the new jni-rs or move off this library
 # entirely.
-jni = "0.19.0"
+jni = "0.21.1"
 static_assertions = "1.1.0"
 uuid = "1.4.0"
 futures = "0.3.28"

@@ -56,7 +56,7 @@ pub mod uuid;
 /// # Arguments
 ///
 /// * `env` - Java environment with which to register native methods.
-pub fn init(env: &JNIEnv) -> Result<()> {
+pub fn init(env: &mut JNIEnv) -> Result<()> {
     ops::jni::init(env)?;
     Ok(())
 }
@@ -108,7 +108,7 @@ pub(crate) mod test_utils {
 
     thread_local! {
         pub static JVM_ENV: JNIEnv<'static> = {
-            let env = JVM.jvm.attach_current_thread_permanently().unwrap();
+            let mut env = JVM.jvm.attach_current_thread_permanently().unwrap();
 
             let thread = env
                 .call_static_method(
@@ -152,8 +152,8 @@ pub(crate) mod test_utils {
                 .unwrap();
             let jvm = JavaVM::new(jvm_args).unwrap();
 
-            let env = jvm.attach_current_thread_permanently().unwrap();
-            crate::init(&env).unwrap();
+            let mut env = jvm.attach_current_thread_permanently().unwrap();
+            crate::init(&mut env).unwrap();
 
             let thread = env
                 .call_static_method(
