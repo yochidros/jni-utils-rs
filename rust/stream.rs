@@ -54,12 +54,7 @@ impl<'a> JStream<'a> {
         let mut env = unsafe { self.env.unsafe_clone() };
         let args = [JValue::from(&waker).as_jni()];
         let result = unsafe {
-            env.call_method_unchecked(
-                &self.internal,
-                self.poll_next,
-                ReturnType::Object,
-                &args,
-            )
+            env.call_method_unchecked(&self.internal, self.poll_next, ReturnType::Object, &args)
         }?
         .l()?;
         Ok(if env.is_same_object(&result, JObject::null())? {
@@ -145,11 +140,13 @@ impl JSendStream {
         context: &mut Context<'_>,
     ) -> Result<Poll<Option<Result<GlobalRef>>>> {
         let mut env = self.vm.get_env()?;
-        let local = env.new_local_ref(&self.internal)?;
-        let jstream = JStream::from_env(&mut env, local)?;
-        jstream
-            .poll_next_internal(context)
-            .map(|result| result.map(|result| result.map(|obj| env.new_global_ref(&obj))))
+        env.with_local_frame(32, |env| {
+            let local = env.new_local_ref(&self.internal)?;
+            let jstream = JStream::from_env(env, local)?;
+            jstream
+                .poll_next_internal(context)
+                .map(|result| result.map(|result| result.map(|obj| env.new_global_ref(&obj))))
+        })
     }
 }
 
@@ -188,15 +185,7 @@ impl<'a> JStreamPoll<'a> {
 
     pub fn get(&self) -> Result<JObject<'a>> {
         let mut env = unsafe { self.env.unsafe_clone() };
-        unsafe {
-            env.call_method_unchecked(
-                &self.internal,
-                self.get,
-                ReturnType::Object,
-                &[],
-            )
-        }?
-        .l()
+        unsafe { env.call_method_unchecked(&self.internal, self.get, ReturnType::Object, &[]) }?.l()
     }
 }
 

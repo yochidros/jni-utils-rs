@@ -60,12 +60,7 @@ impl<'a> JFuture<'a> {
         let mut env = unsafe { self.env.unsafe_clone() };
         let args = [JValue::from(&waker).as_jni()];
         let result = unsafe {
-            env.call_method_unchecked(
-                &self.internal,
-                self.poll,
-                ReturnType::Object,
-                &args,
-            )
+            env.call_method_unchecked(&self.internal, self.poll, ReturnType::Object, &args)
         }?
         .l()?;
         JPollResult::from_env(&mut env, result)
@@ -100,16 +95,12 @@ impl<'a> JFutureIntoFuture<'a> {
     fn poll_internal(&self, context: &mut Context<'_>) -> Result<Poll<JPollResult<'a>>> {
         use crate::task::waker;
         let mut env = unsafe { self.0.env.unsafe_clone() };
-        let result = self
-            .0
-            .poll(waker(&mut env, context.waker().clone())?)?;
-        Ok(
-            if self.0.env.is_same_object(&*result, JObject::null())? {
-                Poll::Pending
-            } else {
-                Poll::Ready(result)
-            },
-        )
+        let result = self.0.poll(waker(&mut env, context.waker().clone())?)?;
+        Ok(if self.0.env.is_same_object(&*result, JObject::null())? {
+            Poll::Pending
+        } else {
+            Poll::Ready(result)
+        })
     }
 }
 
@@ -168,11 +159,13 @@ impl ::std::ops::Deref for JSendFuture {
 impl JSendFuture {
     fn poll_internal(&self, context: &mut Context<'_>) -> Result<Poll<Result<GlobalRef>>> {
         let mut env = self.vm.get_env()?;
-        let local = env.new_local_ref(&self.internal)?;
-        let jfuture = JFuture::from_env(&mut env, local)?.into_future();
-        jfuture
-            .poll_internal(context)
-            .map(|result| result.map(|result| Ok(env.new_global_ref(&*result)?)))
+        env.with_local_frame(32, |env| {
+            let local = env.new_local_ref(&self.internal)?;
+            let jfuture = JFuture::from_env(env, local)?.into_future();
+            jfuture
+                .poll_internal(context)
+                .map(|result| result.map(|result| env.new_global_ref(&*result)))
+        })
     }
 }
 
