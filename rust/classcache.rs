@@ -5,9 +5,11 @@ use ::jni::{errors::Result};
 
 static CLASSCACHE: OnceCell<DashMap<String, GlobalRef>> = OnceCell::new();
 
-pub fn find_add_class(env: &JNIEnv, classname: &str) -> Result<()> {
+pub fn find_add_class(env: &mut JNIEnv, classname: &str) -> Result<()> {
   let cache = CLASSCACHE.get_or_init(|| DashMap::new());
-  cache.insert(classname.to_owned(), env.new_global_ref(env.find_class(classname).unwrap()).unwrap());
+  let class = env.find_class(classname).unwrap();
+  let global = env.new_global_ref(class).unwrap();
+  cache.insert(classname.to_owned(), global);
   Ok(())
 }
 

@@ -1,7 +1,7 @@
 use ::jni::{
     errors::Result,
-    objects::{JMethodID, JObject, JClass},
-    signature::JavaType,
+    objects::{JMethodID, JObject},
+    signature::ReturnType,
     JNIEnv,
 };
 use std::task::Waker;
@@ -16,13 +16,13 @@ use std::task::Waker;
 ///
 /// * `env` - Java environment in which to create the object.
 /// * `waker` - Waker to wrap in a Java object.
-pub fn waker<'a: 'b, 'b>(env: &'b JNIEnv<'a>, waker: Waker) -> Result<JObject<'a>> {
+pub fn waker<'a>(env: &mut JNIEnv<'a>, waker: Waker) -> Result<JObject<'a>> {
     let runnable = crate::ops::fn_once_runnable(env, |_e, _o| waker.wake())?;
 
     let obj = env.new_object(
-        JClass::from(crate::classcache::get_class("io/github/gedgygedgy/rust/task/Waker").unwrap().as_obj()),
+        &crate::classcache::get_class("io/github/gedgygedgy/rust/task/Waker").unwrap(),
         "(Lio/github/gedgygedgy/rust/ops/FnRunnable;)V",
-        &[runnable.into()],
+        &[(&runnable).into()],
     )?;
     Ok(obj)
 }
@@ -33,13 +33,13 @@ pub fn waker<'a: 'b, 'b>(env: &'b JNIEnv<'a>, waker: Waker) -> Result<JObject<'a
 ///
 /// Looks up the class and method IDs on creation rather than for every method
 /// call.
-pub struct JPollResult<'a: 'b, 'b> {
+pub struct JPollResult<'a> {
     internal: JObject<'a>,
-    get: JMethodID<'a>,
-    env: &'b JNIEnv<'a>,
+    get: JMethodID,
+    env: JNIEnv<'a>,
 }
 
-impl<'a: 'b, 'b> JPollResult<'a, 'b> {
+impl<'a> JPollResult<'a> {
     /// Create a [`JPollResult`] from the environment and an object. This looks
     /// up the necessary class and method IDs to call all of the methods on it
     /// so that extra work doesn't need to be done on every method call.
@@ -48,15 +48,16 @@ impl<'a: 'b, 'b> JPollResult<'a, 'b> {
     ///
     /// * `env` - Java environment to use.
     /// * `obj` - Object to wrap.
-    pub fn from_env(env: &'b JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
+    pub fn from_env(env: &mut JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
         let get = env.get_method_id(
-            JClass::from(crate::classcache::get_class("io/github/gedgygedgy/rust/task/PollResult").unwrap().as_obj()), 
-            "get", 
-            "()Ljava/lang/Object;")?;
+            &crate::classcache::get_class("io/github/gedgygedgy/rust/task/PollResult").unwrap(),
+            "get",
+            "()Ljava/lang/Object;",
+        )?;
         Ok(Self {
             internal: obj,
             get,
-            env,
+            env: unsafe { env.unsafe_clone() },
         })
     }
 
@@ -64,18 +65,20 @@ impl<'a: 'b, 'b> JPollResult<'a, 'b> {
     /// `io.github.gedgygedgy.rust.task.PollResult.get()`. Can throw an
     /// exception.
     pub fn get(&self) -> Result<JObject<'a>> {
-        self.env
-            .call_method_unchecked(
-                self.internal,
+        let mut env = unsafe { self.env.unsafe_clone() };
+        unsafe {
+            env.call_method_unchecked(
+                &self.internal,
                 self.get,
-                JavaType::Object("java/lang/Object".into()),
+                ReturnType::Object,
                 &[],
-            )?
-            .l()
+            )
+        }?
+        .l()
     }
 }
 
-impl<'a: 'b, 'b> ::std::ops::Deref for JPollResult<'a, 'b> {
+impl<'a> ::std::ops::Deref for JPollResult<'a> {
     type Target = JObject<'a>;
 
     fn deref(&self) -> &Self::Target {
@@ -83,8 +86,8 @@ impl<'a: 'b, 'b> ::std::ops::Deref for JPollResult<'a, 'b> {
     }
 }
 
-impl<'a: 'b, 'b> From<JPollResult<'a, 'b>> for JObject<'a> {
-    fn from(other: JPollResult<'a, 'b>) -> JObject<'a> {
+impl<'a> From<JPollResult<'a>> for JObject<'a> {
+    fn from(other: JPollResult<'a>) -> JObject<'a> {
         other.internal
     }
 }

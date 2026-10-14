@@ -1,8 +1,8 @@
 use crate::task::JPollResult;
 use ::jni::{
     errors::{Error, Result},
-    objects::{GlobalRef, JMethodID, JObject, JClass},
-    signature::JavaType,
+    objects::{GlobalRef, JMethodID, JObject, JValue},
+    signature::ReturnType,
     JNIEnv, JavaVM,
 };
 use futures::stream::Stream;
@@ -22,13 +22,13 @@ use std::{
 /// call.
 ///
 /// For a [`Send`] version of this, use [`JSendStream`].
-pub struct JStream<'a: 'b, 'b> {
+pub struct JStream<'a> {
     internal: JObject<'a>,
-    poll_next: JMethodID<'a>,
-    env: &'b JNIEnv<'a>,
+    poll_next: JMethodID,
+    env: JNIEnv<'a>,
 }
 
-impl<'a: 'b, 'b> JStream<'a, 'b> {
+impl<'a> JStream<'a> {
     /// Create a [`JStream`] from the environment and an object. This looks
     /// up the necessary class and method IDs to call all of the methods on it
     /// so that extra work doesn't need to be done on every method call.
@@ -37,40 +37,36 @@ impl<'a: 'b, 'b> JStream<'a, 'b> {
     ///
     /// * `env` - Java environment to use.
     /// * `obj` - Object to wrap.
-    pub fn from_env(env: &'b JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
+    pub fn from_env(env: &mut JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
         let poll_next = env.get_method_id(
-            JClass::from(crate::classcache::get_class("io/github/gedgygedgy/rust/stream/Stream").unwrap().as_obj()),
+            &crate::classcache::get_class("io/github/gedgygedgy/rust/stream/Stream").unwrap(),
             "pollNext",
             "(Lio/github/gedgygedgy/rust/task/Waker;)Lio/github/gedgygedgy/rust/task/PollResult;",
         )?;
         Ok(Self {
             internal: obj,
             poll_next,
-            env,
+            env: unsafe { env.unsafe_clone() },
         })
     }
 
     fn j_poll_next(&self, waker: JObject<'a>) -> Result<Poll<Option<JObject<'a>>>> {
-        let result = self
-            .env
-            .call_method_unchecked(
-                self.internal,
-                self.poll_next,
-                JavaType::Object("io/github/gedgygedgy/rust/task/PollResult".to_string()),
-                &[waker.into()],
-            )?
-            .l()?;
-        let _auto_local = self.env.auto_local(result);
-        Ok(if self.env.is_same_object(result, JObject::null())? {
+        let mut env = unsafe { self.env.unsafe_clone() };
+        let args = [JValue::from(&waker).as_jni()];
+        let result = unsafe {
+            env.call_method_unchecked(&self.internal, self.poll_next, ReturnType::Object, &args)
+        }?
+        .l()?;
+        Ok(if env.is_same_object(&result, JObject::null())? {
             Poll::Pending
         } else {
             Poll::Ready({
-                let poll = JPollResult::from_env(self.env, result)?;
+                let poll = JPollResult::from_env(&mut env, result)?;
                 let stream_poll_obj = poll.get()?;
-                if self.env.is_same_object(stream_poll_obj, JObject::null())? {
+                if env.is_same_object(&stream_poll_obj, JObject::null())? {
                     None
                 } else {
-                    let stream_poll = JStreamPoll::from_env(self.env, stream_poll_obj)?;
+                    let stream_poll = JStreamPoll::from_env(&mut env, stream_poll_obj)?;
                     Some(stream_poll.get()?)
                 }
             })
@@ -80,11 +76,12 @@ impl<'a: 'b, 'b> JStream<'a, 'b> {
     // Switch the Result and Poll return value to make this easier to implement using ?.
     fn poll_next_internal(&self, context: &mut Context) -> Result<Poll<Option<JObject<'a>>>> {
         use crate::task::waker;
-        self.j_poll_next(waker(self.env, context.waker().clone())?)
+        let mut env = unsafe { self.env.unsafe_clone() };
+        self.j_poll_next(waker(&mut env, context.waker().clone())?)
     }
 }
 
-impl<'a: 'b, 'b> ::std::ops::Deref for JStream<'a, 'b> {
+impl<'a> ::std::ops::Deref for JStream<'a> {
     type Target = JObject<'a>;
 
     fn deref(&self) -> &Self::Target {
@@ -92,13 +89,13 @@ impl<'a: 'b, 'b> ::std::ops::Deref for JStream<'a, 'b> {
     }
 }
 
-impl<'a: 'b, 'b> From<JStream<'a, 'b>> for JObject<'a> {
-    fn from(other: JStream<'a, 'b>) -> JObject<'a> {
+impl<'a> From<JStream<'a>> for JObject<'a> {
+    fn from(other: JStream<'a>) -> JObject<'a> {
         other.internal
     }
 }
 
-impl<'a: 'b, 'b> Stream for JStream<'a, 'b> {
+impl<'a> Stream for JStream<'a> {
     type Item = Result<JObject<'a>>;
 
     fn poll_next(self: Pin<&mut Self>, context: &mut Context) -> Poll<Option<Self::Item>> {
@@ -118,12 +115,12 @@ pub struct JSendStream {
     vm: JavaVM,
 }
 
-impl<'a: 'b, 'b> TryFrom<JStream<'a, 'b>> for JSendStream {
+impl<'a> TryFrom<JStream<'a>> for JSendStream {
     type Error = Error;
 
-    fn try_from(stream: JStream<'a, 'b>) -> Result<Self> {
+    fn try_from(stream: JStream<'a>) -> Result<Self> {
         Ok(Self {
-            internal: stream.env.new_global_ref(stream.internal)?,
+            internal: stream.env.new_global_ref(&stream.internal)?,
             vm: stream.env.get_java_vm()?,
         })
     }
@@ -142,11 +139,14 @@ impl JSendStream {
         &self,
         context: &mut Context<'_>,
     ) -> Result<Poll<Option<Result<GlobalRef>>>> {
-        let env = self.vm.get_env()?;
-        let jstream = JStream::from_env(&env, self.internal.as_obj())?;
-        jstream
-            .poll_next_internal(context)
-            .map(|result| result.map(|result| result.map(|obj| env.new_global_ref(obj))))
+        let mut env = self.vm.get_env()?;
+        env.with_local_frame(32, |env| {
+            let local = env.new_local_ref(&self.internal)?;
+            let jstream = JStream::from_env(env, local)?;
+            jstream
+                .poll_next_internal(context)
+                .map(|result| result.map(|result| result.map(|obj| env.new_global_ref(&obj))))
+        })
     }
 }
 
@@ -163,34 +163,29 @@ impl Stream for JSendStream {
 
 assert_impl_all!(JSendStream: Send);
 
-struct JStreamPoll<'a: 'b, 'b> {
+struct JStreamPoll<'a> {
     internal: JObject<'a>,
-    get: JMethodID<'a>,
-    env: &'b JNIEnv<'a>,
+    get: JMethodID,
+    env: JNIEnv<'a>,
 }
 
-impl<'a: 'b, 'b> JStreamPoll<'a, 'b> {
-    pub fn from_env(env: &'b JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
+impl<'a> JStreamPoll<'a> {
+    pub fn from_env(env: &mut JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
         let get = env.get_method_id(
-            JClass::from(crate::classcache::get_class("io/github/gedgygedgy/rust/stream/StreamPoll").unwrap().as_obj()),
-            "get", 
-            "()Ljava/lang/Object;")?;
+            &crate::classcache::get_class("io/github/gedgygedgy/rust/stream/StreamPoll").unwrap(),
+            "get",
+            "()Ljava/lang/Object;",
+        )?;
         Ok(Self {
             internal: obj,
             get,
-            env,
+            env: unsafe { env.unsafe_clone() },
         })
     }
 
     pub fn get(&self) -> Result<JObject<'a>> {
-        self.env
-            .call_method_unchecked(
-                self.internal,
-                self.get,
-                JavaType::Object("java/lang/Object".into()),
-                &[],
-            )?
-            .l()
+        let mut env = unsafe { self.env.unsafe_clone() };
+        unsafe { env.call_method_unchecked(&self.internal, self.get, ReturnType::Object, &[]) }?.l()
     }
 }
 

@@ -6,8 +6,7 @@ use jni::{
 };
 use std::{
     any::Any,
-    convert::TryFrom,
-    panic::{catch_unwind, resume_unwind, UnwindSafe},
+    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     sync::MutexGuard,
 };
 
@@ -16,7 +15,7 @@ use std::{
 /// with the try/catch sequence, the result can be obtained from
 /// [`result`](TryCatchResult::result).
 pub struct TryCatchResult<'a: 'b, 'b, T> {
-    env: &'b JNIEnv<'a>,
+    env: &'b mut JNIEnv<'a>,
     try_result: Result<Result<T, Error>, Error>,
     catch_result: Option<Result<T, Error>>,
 }
@@ -32,18 +31,17 @@ pub struct TryCatchResult<'a: 'b, 'b, T> {
 /// * `env` - Java environment to use.
 /// * `block` - Block of JNI code to run.
 pub fn try_block<'a: 'b, 'b, T>(
-    env: &'b JNIEnv<'a>,
-    block: impl FnOnce() -> Result<T, Error>,
+    env: &'b mut JNIEnv<'a>,
+    block: impl FnOnce(&mut JNIEnv<'a>) -> Result<T, Error>,
 ) -> TryCatchResult<'a, 'b, T> {
+    let try_result = match env.exception_check() {
+        Ok(true) => Err(Error::JavaException),
+        Ok(false) => Ok(block(env)),
+        Err(err) => Err(err),
+    };
     TryCatchResult {
         env,
-        try_result: (|| {
-            if env.exception_check()? {
-                Err(Error::JavaException)
-            } else {
-                Ok(block())
-            }
-        })(),
+        try_result,
         catch_result: None,
     }
 }
@@ -61,7 +59,7 @@ impl<'a: 'b, 'b, T> TryCatchResult<'a, 'b, T> {
     pub fn catch(
         self,
         class: impl Desc<'a, JClass<'a>>,
-        block: impl FnOnce(JThrowable<'a>) -> Result<T, Error>,
+        block: impl FnOnce(&mut JNIEnv<'a>, JThrowable<'a>) -> Result<T, Error>,
     ) -> Self {
         match (self.try_result, self.catch_result) {
             (Err(e), _) => Self {
@@ -84,10 +82,10 @@ impl<'a: 'b, 'b, T> TryCatchResult<'a, 'b, T> {
                 let catch_result = (|| {
                     if env.exception_check()? {
                         let ex = env.exception_occurred()?;
-                        let _auto_local = env.auto_local(ex.clone());
+                        let _auto_local = env.auto_local(env.new_local_ref(&ex)?);
                         env.exception_clear()?;
-                        if env.is_instance_of(ex, class)? {
-                            return block(ex).map(|o| Some(o));
+                        if env.is_instance_of(&ex, class)? {
+                            return block(env, ex).map(|o| Some(o));
                         }
                         env.throw(ex)?;
                     }
@@ -127,12 +125,11 @@ impl<'a: 'b, 'b, T> TryCatchResult<'a, 'b, T> {
 ///
 /// Looks up the class and method IDs on creation rather than for every method
 /// call.
-pub struct JPanicException<'a: 'b, 'b> {
+pub struct JPanicException<'a> {
     internal: JThrowable<'a>,
-    env: &'b JNIEnv<'a>,
 }
 
-impl<'a: 'b, 'b> JPanicException<'a, 'b> {
+impl<'a> JPanicException<'a> {
     /// Create a [`JPanicException`] from the environment and an object. This
     /// looks up the necessary class and method IDs to call all of the methods
     /// on it so that extra work doesn't need to be done on every method call.
@@ -141,8 +138,8 @@ impl<'a: 'b, 'b> JPanicException<'a, 'b> {
     ///
     /// * `env` - Java environment to use.
     /// * `obj` - Object to wrap.
-    pub fn from_env(env: &'b JNIEnv<'a>, obj: JThrowable<'a>) -> Result<Self, Error> {
-        Ok(Self { internal: obj, env })
+    pub fn from_env(obj: JThrowable<'a>) -> Result<Self, Error> {
+        Ok(Self { internal: obj })
     }
 
     /// Create a new `PanicException` from the given [`Any`].
@@ -151,7 +148,7 @@ impl<'a: 'b, 'b> JPanicException<'a, 'b> {
     ///
     /// * `env` - Java environment to use.
     /// * `any` - [`Any`] to put in the `PanicException`.
-    pub fn new(env: &'b JNIEnv<'a>, any: Box<dyn Any + Send + 'static>) -> Result<Self, Error> {
+    pub fn new(env: &mut JNIEnv<'a>, any: Box<dyn Any + Send + 'static>) -> Result<Self, Error> {
         let msg = if let Some(s) = any.downcast_ref::<&str>() {
             env.new_string(s)?
         } else if let Some(s) = any.downcast_ref::<String>() {
@@ -163,43 +160,40 @@ impl<'a: 'b, 'b> JPanicException<'a, 'b> {
         let obj = env.new_object(
             "io/github/gedgygedgy/rust/panic/PanicException",
             "(Ljava/lang/String;)V",
-            &[msg.into()],
+            &[(&msg).into()],
         )?;
-        env.set_rust_field(obj, "any", any)?;
-        Self::from_env(env, obj.into())
+        unsafe {
+            env.set_rust_field(&obj, "any", any)?;
+        }
+        Self::from_env(obj.into())
     }
 
     /// Borrows the [`Any`] associated with the exception.
-    pub fn get(&self) -> Result<MutexGuard<Box<dyn Any + Send + 'static>>, Error> {
-        self.env.get_rust_field(self.internal, "any")
+    pub fn get<'b>(
+        &self,
+        env: &'b mut JNIEnv<'a>,
+    ) -> Result<MutexGuard<'b, Box<dyn Any + Send + 'static>>, Error> {
+        unsafe { env.get_rust_field(&self.internal, "any") }
     }
 
     /// Takes the [`Any`] associated with the exception.
-    pub fn take(&self) -> Result<Box<dyn Any + Send + 'static>, Error> {
-        self.env.take_rust_field(self.internal, "any")
+    pub fn take(&self, env: &mut JNIEnv<'a>) -> Result<Box<dyn Any + Send + 'static>, Error> {
+        unsafe { env.take_rust_field(&self.internal, "any") }
     }
 
     /// Resumes unwinding using the [`Any`] associated with the exception.
-    pub fn resume_unwind(&self) -> Result<(), Error> {
-        resume_unwind(self.take()?);
+    pub fn resume_unwind(&self, env: &mut JNIEnv<'a>) -> Result<(), Error> {
+        resume_unwind(self.take(env)?);
     }
 }
 
-impl<'a: 'b, 'b> TryFrom<JPanicException<'a, 'b>> for Box<dyn Any + Send + 'static> {
-    type Error = Error;
-
-    fn try_from(ex: JPanicException<'a, 'b>) -> Result<Self, Error> {
-        ex.take()
-    }
-}
-
-impl<'a: 'b, 'b> From<JPanicException<'a, 'b>> for JThrowable<'a> {
-    fn from(ex: JPanicException<'a, 'b>) -> Self {
+impl<'a> From<JPanicException<'a>> for JThrowable<'a> {
+    fn from(ex: JPanicException<'a>) -> Self {
         ex.internal
     }
 }
 
-impl<'a: 'b, 'b> ::std::ops::Deref for JPanicException<'a, 'b> {
+impl<'a> ::std::ops::Deref for JPanicException<'a> {
     type Target = JThrowable<'a>;
 
     fn deref(&self) -> &Self::Target {
@@ -215,10 +209,10 @@ impl<'a: 'b, 'b> ::std::ops::Deref for JPanicException<'a, 'b> {
 /// * `env` - Java environment to use.
 /// * `f` - Closure to call.
 pub fn throw_unwind<'a: 'b, 'b, R>(
-    env: &'b JNIEnv<'a>,
-    f: impl FnOnce() -> R + UnwindSafe,
+    env: &'b mut JNIEnv<'a>,
+    f: impl FnOnce(&mut JNIEnv<'a>) -> R,
 ) -> Result<R, Result<(), Error>> {
-    catch_unwind(f).map_err(|e| {
+    catch_unwind(AssertUnwindSafe(|| f(env))).map_err(|e| {
         let old_ex = if env.exception_check()? {
             let ex = env.exception_occurred()?;
             env.exception_clear()?;
@@ -230,10 +224,10 @@ pub fn throw_unwind<'a: 'b, 'b, R>(
 
         if let Some(old_ex) = old_ex {
             env.call_method(
-                ex.clone(),
+                &*ex,
                 "addSuppressed",
                 "(Ljava/lang/Throwable;)V",
-                &[old_ex.into()],
+                &[(&old_ex).into()],
             )?;
         }
         let ex: JThrowable = ex.into();

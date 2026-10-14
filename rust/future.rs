@@ -1,8 +1,8 @@
 use crate::task::JPollResult;
 use ::jni::{
     errors::{Error, Result},
-    objects::{GlobalRef, JMethodID, JObject, JClass},
-    signature::JavaType,
+    objects::{GlobalRef, JMethodID, JObject, JValue},
+    signature::ReturnType,
     JNIEnv, JavaVM,
 };
 use static_assertions::assert_impl_all;
@@ -22,13 +22,13 @@ use std::{
 /// call.
 ///
 /// For a [`Send`] version of this, use [`JSendFuture`].
-pub struct JFuture<'a: 'b, 'b> {
+pub struct JFuture<'a> {
     internal: JObject<'a>,
-    poll: JMethodID<'a>,
-    env: &'b JNIEnv<'a>,
+    poll: JMethodID,
+    env: JNIEnv<'a>,
 }
 
-impl<'a: 'b, 'b> JFuture<'a, 'b> {
+impl<'a> JFuture<'a> {
     /// Create a [`JFuture`] from the environment and an object. This looks up
     /// the necessary class and method IDs to call all of the methods on it so
     /// that extra work doesn't need to be done on every method call.
@@ -37,16 +37,16 @@ impl<'a: 'b, 'b> JFuture<'a, 'b> {
     ///
     /// * `env` - Java environment to use.
     /// * `obj` - Object to wrap.
-    pub fn from_env(env: &'b JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
+    pub fn from_env(env: &mut JNIEnv<'a>, obj: JObject<'a>) -> Result<Self> {
         let poll = env.get_method_id(
-            JClass::from(crate::classcache::get_class("io/github/gedgygedgy/rust/future/Future").unwrap().as_obj()),
+            &crate::classcache::get_class("io/github/gedgygedgy/rust/future/Future").unwrap(),
             "poll",
             "(Lio/github/gedgygedgy/rust/task/Waker;)Lio/github/gedgygedgy/rust/task/PollResult;",
         )?;
         Ok(Self {
             internal: obj,
             poll,
-            env,
+            env: unsafe { env.unsafe_clone() },
         })
     }
 
@@ -56,26 +56,23 @@ impl<'a: 'b, 'b> JFuture<'a, 'b> {
     /// # Arguments
     ///
     /// * `waker` - Waker object to wake later on if the result is not ready.
-    pub fn poll(&self, waker: JObject<'a>) -> Result<JPollResult<'a, 'b>> {
-        let result = self
-            .env
-            .call_method_unchecked(
-                self.internal,
-                self.poll,
-                JavaType::Object("io/github/gedgygedgy/rust/task/PollResult".into()),
-                &[waker.into()],
-            )?
-            .l()?;
-        JPollResult::from_env(self.env, result)
+    pub fn poll(&self, waker: JObject<'a>) -> Result<JPollResult<'a>> {
+        let mut env = unsafe { self.env.unsafe_clone() };
+        let args = [JValue::from(&waker).as_jni()];
+        let result = unsafe {
+            env.call_method_unchecked(&self.internal, self.poll, ReturnType::Object, &args)
+        }?
+        .l()?;
+        JPollResult::from_env(&mut env, result)
     }
 
     /// Turn the [`JFuture`] into a [`Future`] that can be `await`ed on.
-    pub fn into_future(self) -> JFutureIntoFuture<'a, 'b> {
+    pub fn into_future(self) -> JFutureIntoFuture<'a> {
         JFutureIntoFuture(self)
     }
 }
 
-impl<'a: 'b, 'b> ::std::ops::Deref for JFuture<'a, 'b> {
+impl<'a> ::std::ops::Deref for JFuture<'a> {
     type Target = JObject<'a>;
 
     fn deref(&self) -> &Self::Target {
@@ -83,33 +80,32 @@ impl<'a: 'b, 'b> ::std::ops::Deref for JFuture<'a, 'b> {
     }
 }
 
-impl<'a: 'b, 'b> From<JFuture<'a, 'b>> for JObject<'a> {
-    fn from(other: JFuture<'a, 'b>) -> JObject<'a> {
+impl<'a> From<JFuture<'a>> for JObject<'a> {
+    fn from(other: JFuture<'a>) -> JObject<'a> {
         other.internal
     }
 }
 
 /// Result of calling [`JFuture::into_future`]. This object can be `await`ed
 /// to get a [`JPollResult`].
-pub struct JFutureIntoFuture<'a: 'b, 'b>(JFuture<'a, 'b>);
+pub struct JFutureIntoFuture<'a>(JFuture<'a>);
 
-impl<'a: 'b, 'b> JFutureIntoFuture<'a, 'b> {
+impl<'a> JFutureIntoFuture<'a> {
     // Switch the Result and Poll return value to make this easier to implement using ?.
-    fn poll_internal(&self, context: &mut Context<'_>) -> Result<Poll<JPollResult<'a, 'b>>> {
+    fn poll_internal(&self, context: &mut Context<'_>) -> Result<Poll<JPollResult<'a>>> {
         use crate::task::waker;
-        let result = self.0.poll(waker(self.0.env, context.waker().clone())?)?;
-        Ok(
-            if self.0.env.is_same_object(result.clone(), JObject::null())? {
-                Poll::Pending
-            } else {
-                Poll::Ready(result)
-            },
-        )
+        let mut env = unsafe { self.0.env.unsafe_clone() };
+        let result = self.0.poll(waker(&mut env, context.waker().clone())?)?;
+        Ok(if self.0.env.is_same_object(&*result, JObject::null())? {
+            Poll::Pending
+        } else {
+            Poll::Ready(result)
+        })
     }
 }
 
-impl<'a: 'b, 'b> Future for JFutureIntoFuture<'a, 'b> {
-    type Output = Result<JPollResult<'a, 'b>>;
+impl<'a> Future for JFutureIntoFuture<'a> {
+    type Output = Result<JPollResult<'a>>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         match self.poll_internal(context) {
@@ -120,14 +116,14 @@ impl<'a: 'b, 'b> Future for JFutureIntoFuture<'a, 'b> {
     }
 }
 
-impl<'a: 'b, 'b> From<JFutureIntoFuture<'a, 'b>> for JFuture<'a, 'b> {
-    fn from(fut: JFutureIntoFuture<'a, 'b>) -> Self {
+impl<'a> From<JFutureIntoFuture<'a>> for JFuture<'a> {
+    fn from(fut: JFutureIntoFuture<'a>) -> Self {
         fut.0
     }
 }
 
-impl<'a: 'b, 'b> std::ops::Deref for JFutureIntoFuture<'a, 'b> {
-    type Target = JFuture<'a, 'b>;
+impl<'a> std::ops::Deref for JFutureIntoFuture<'a> {
+    type Target = JFuture<'a>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -141,12 +137,12 @@ pub struct JSendFuture {
     vm: JavaVM,
 }
 
-impl<'a: 'b, 'b> TryFrom<JFuture<'a, 'b>> for JSendFuture {
+impl<'a> TryFrom<JFuture<'a>> for JSendFuture {
     type Error = Error;
 
-    fn try_from(future: JFuture<'a, 'b>) -> Result<Self> {
+    fn try_from(future: JFuture<'a>) -> Result<Self> {
         Ok(Self {
-            internal: future.env.new_global_ref(future.internal)?,
+            internal: future.env.new_global_ref(&future.internal)?,
             vm: future.env.get_java_vm()?,
         })
     }
@@ -162,11 +158,14 @@ impl ::std::ops::Deref for JSendFuture {
 
 impl JSendFuture {
     fn poll_internal(&self, context: &mut Context<'_>) -> Result<Poll<Result<GlobalRef>>> {
-        let env = self.vm.get_env()?;
-        let jfuture = JFuture::from_env(&env, self.internal.as_obj())?.into_future();
-        jfuture
-            .poll_internal(context)
-            .map(|result| result.map(|result| Ok(env.new_global_ref(result)?)))
+        let mut env = self.vm.get_env()?;
+        env.with_local_frame(32, |env| {
+            let local = env.new_local_ref(&self.internal)?;
+            let jfuture = JFuture::from_env(env, local)?.into_future();
+            jfuture
+                .poll_internal(context)
+                .map(|result| result.map(|result| env.new_global_ref(&*result)))
+        })
     }
 }
 
